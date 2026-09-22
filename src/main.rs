@@ -102,10 +102,12 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum ConfigCmd {
-    /// Валидация env, включая C9 (APP_WAIT_MIN vs TimeoutStartSec).
+    /// Все действующие значения и валидация, включая C9.
     Check {
         #[arg(long)]
         instance: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -154,7 +156,9 @@ async fn run_command(cli: Cli) -> Result<i32> {
         Command::WatchPrs { instance, json } => cmd_watch_prs(instance.as_deref(), json).await,
         Command::Status { instance } => cmd_status(instance.as_deref()).await,
         Command::Config { action } => match action {
-            ConfigCmd::Check { instance } => cmd_config_check(instance.as_deref()).await,
+            ConfigCmd::Check { instance, json } => {
+                cmd_config_check(instance.as_deref(), json).await
+            }
         },
         Command::Doctor => cmd_doctor().await,
     }
@@ -591,7 +595,7 @@ async fn cmd_status(instance: Option<&str>) -> Result<i32> {
     Ok(exit::OK)
 }
 
-async fn cmd_config_check(instance: Option<&str>) -> Result<i32> {
+async fn cmd_config_check(instance: Option<&str>, as_json: bool) -> Result<i32> {
     let cfg = match load_config(instance) {
         Ok(cfg) => cfg,
         Err(code) => return Ok(code),
@@ -599,46 +603,122 @@ async fn cmd_config_check(instance: Option<&str>) -> Result<i32> {
     let mut report = cfg.validate();
     cfg.check_unit_timeout(&mut report).await;
 
+    let auth = match cfg.auth {
+        Some(AgentAuth::Oauth) => "CLAUDE_CODE_OAUTH_TOKEN",
+        Some(AgentAuth::ApiKey) => "ANTHROPIC_API_KEY",
+        None => "не задана",
+    };
+    let authors = if cfg.allowed_authors.is_empty() {
+        "(владелец gh-токена)".to_string()
+    } else {
+        cfg.allowed_authors.join(" ")
+    };
+    let partner = cfg
+        .partner_repo
+        .clone()
+        .unwrap_or_else(|| "(не задан)".to_string());
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "instance": cfg.instance,
+                "source": cfg.source,
+                "REPO_DIR": cfg.repo_dir,
+                "BASE_BRANCH": cfg.base_branch,
+                "DEV_MODE": cfg.dev_mode.as_str(),
+                "TASK_LABEL": cfg.task_label,
+                "HUMAN_LABEL": cfg.human_label,
+                "BLOCKED_LABEL": cfg.blocked_label,
+                "ALLOWED_AUTHORS": cfg.allowed_authors,
+                "PARTNER_REPO": cfg.partner_repo,
+                "MAX_ITERATIONS": cfg.max_iterations,
+                "MAX_REVIEW_ROUNDS": cfg.max_review_rounds,
+                "CI_START_WAIT": cfg.ci_start_wait,
+                "APP_WAIT_MIN": cfg.app_wait_min,
+                "AUTO_MERGE": cfg.auto_merge,
+                "CLAUDE_MODEL": cfg.claude_model,
+                "MAX_BUDGET_USD": cfg.max_budget_usd,
+                "PR_STALE_DAYS": cfg.pr_stale_days,
+                "MAX_NEW_TASKS": cfg.max_new_tasks,
+                "KEEPER_INTERVAL_DAYS": cfg.keeper_interval_days,
+                "LOCK_FILE": cfg.lock_file,
+                "auth": auth,
+                "telegram": cfg.telegram().is_some(),
+                "errors": report.errors,
+                "warnings": report.warnings,
+            }))?
+        );
+        return Ok(if report.ok() { exit::OK } else { exit::CONFIG });
+    }
+
+    // Секреты не печатаем: конфиг читают через плечо, а токен подписки —
+    // это доступ ко всему аккаунту.
+    let rows: Vec<(&str, String)> = vec![
+        ("REPO_DIR", cfg.repo_dir.display().to_string()),
+        ("BASE_BRANCH", cfg.base_branch.clone()),
+        ("DEV_MODE", cfg.dev_mode.as_str().to_string()),
+        ("TASK_LABEL", cfg.task_label.clone()),
+        ("HUMAN_LABEL", cfg.human_label.clone()),
+        ("BLOCKED_LABEL", cfg.blocked_label.clone()),
+        ("ALLOWED_AUTHORS", authors),
+        ("PARTNER_REPO", partner),
+        ("MAX_ITERATIONS", cfg.max_iterations.to_string()),
+        ("MAX_REVIEW_ROUNDS", cfg.max_review_rounds.to_string()),
+        ("CI_START_WAIT", format!("{} с", cfg.ci_start_wait)),
+        ("APP_WAIT_MIN", format!("{} мин", cfg.app_wait_min)),
+        ("AUTO_MERGE", cfg.auto_merge.to_string()),
+        ("CLAUDE_MODEL", cfg.claude_model.clone()),
+        (
+            "MAX_BUDGET_USD",
+            match cfg.auth {
+                Some(AgentAuth::ApiKey) => cfg.max_budget_usd.clone(),
+                _ => format!(
+                    "{} (не действует без ANTHROPIC_API_KEY)",
+                    cfg.max_budget_usd
+                ),
+            },
+        ),
+        ("PR_STALE_DAYS", format!("{} дн.", cfg.pr_stale_days)),
+        ("MAX_NEW_TASKS", cfg.max_new_tasks.to_string()),
+        (
+            "KEEPER_INTERVAL_DAYS",
+            format!("{} дн.", cfg.keeper_interval_days),
+        ),
+        ("LOCK_FILE", cfg.lock_file.display().to_string()),
+        ("Аутентификация", auth.to_string()),
+        (
+            "Telegram",
+            if cfg.telegram().is_some() {
+                "настроен".to_string()
+            } else {
+                "выключен".to_string()
+            },
+        ),
+    ];
+
     println!(
-        "Инстанс:          {}",
+        "Инстанс: {}",
         cfg.instance
             .clone()
             .unwrap_or_else(|| "(из окружения)".into())
     );
-    println!("REPO_DIR:         {}", cfg.repo_dir.display());
-    println!("DEV_MODE:         {}", cfg.dev_mode.as_str());
-    println!(
-        "Аутентификация:   {}",
-        match cfg.auth {
-            Some(AgentAuth::Oauth) => "CLAUDE_CODE_OAUTH_TOKEN",
-            Some(AgentAuth::ApiKey) => "ANTHROPIC_API_KEY",
-            None => "не задана",
-        }
-    );
-    println!("APP_WAIT_MIN:     {} мин", cfg.app_wait_min);
-    println!("LOCK_FILE:        {}", cfg.lock_file.display());
-    println!(
-        "PARTNER_REPO:     {}",
-        cfg.partner_repo
-            .clone()
-            .unwrap_or_else(|| "(не задан)".into())
-    );
-    println!(
-        "ALLOWED_AUTHORS:  {}",
-        if cfg.allowed_authors.is_empty() {
-            "(владелец токена)".to_string()
-        } else {
-            cfg.allowed_authors.join(", ")
-        }
-    );
-    println!(
-        "Telegram:         {}",
-        if cfg.telegram().is_some() {
-            "настроен"
-        } else {
-            "выключен"
-        }
-    );
+    match &cfg.source {
+        Some(p) => println!("Конфиг:  {}", p.display()),
+        None => println!("Конфиг:  файл не читался — значения взяты из окружения"),
+    }
+    println!("Логи:    {}", cfg.log_dir().display());
+    println!();
+    for (key, value) in rows {
+        // Переменная окружения важнее файла: под systemd так и работает, а в
+        // ручном запуске это первая причина «правлю файл, ничего не меняется».
+        let from_env = match std::env::var(key) {
+            Ok(v) if !v.is_empty() => " ← из окружения",
+            _ => "",
+        };
+        println!("  {key:<22} {value}{from_env}");
+    }
+    println!();
 
     for w in &report.warnings {
         println!("⚠️  {w}");
