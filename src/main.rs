@@ -343,12 +343,21 @@ async fn cmd_backlog(instance: Option<&str>, force: bool, dry_run: bool) -> Resu
     }
 
     // C10: замок общий с оркестратором — смотритель переставляет метки,
-    // и делать это под работающей итерацией нельзя.
-    let _guard = match lock::try_acquire(&ctx.cfg.lock_file)? {
-        Some(g) => g,
-        None => {
-            tracing::info!("Итерация ai-dev идёт — смотритель попробует через час.");
-            return Ok(exit::OK);
+    // и делать это под работающей итерацией нельзя. В сухом прогоне замок
+    // не берём по той же причине, что и в `run`: он идёт рядом с боевым
+    // циклом и не должен отбирать у него круг.
+    let _guard = if dry_run {
+        if lock::is_busy(&ctx.cfg.lock_file).unwrap_or(false) {
+            tracing::info!("Итерация ai-dev идёт — сухой прогон продолжаю только на чтение.");
+        }
+        None
+    } else {
+        match lock::try_acquire(&ctx.cfg.lock_file)? {
+            Some(g) => Some(g),
+            None => {
+                tracing::info!("Итерация ai-dev идёт — смотритель попробует через час.");
+                return Ok(exit::OK);
+            }
         }
     };
 

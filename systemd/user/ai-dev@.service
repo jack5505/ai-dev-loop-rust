@@ -7,6 +7,9 @@ Type=oneshot
 EnvironmentFile=%h/.config/ai-dev-%i.env
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=%h
+# Агент в режиме DEV_MODE=local запускает сборку и тесты проекта, поэтому
+# сюда же добавляются нужные ему переменные, например:
+# Environment=JAVA_HOME=%h/.local/opt/jdk21
 ExecStart=%h/.local/bin/ai-dev run --instance %i
 Nice=10
 # C9: потолок обязан быть заметно больше APP_WAIT_MIN (по умолчанию 180 мин).
