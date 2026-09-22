@@ -470,6 +470,52 @@ fn find_instance_file(instance: &str) -> Option<PathBuf> {
     candidate_files(instance).into_iter().find(|p| p.is_file())
 }
 
+/// Каталоги, где ищутся конфиги инстансов, — в порядке приоритета.
+pub fn instance_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(d) = std::env::var_os("AI_DEV_CONFIG_DIR") {
+        dirs.push(PathBuf::from(d));
+    }
+    dirs.push(PathBuf::from("/etc"));
+    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME") {
+        dirs.push(PathBuf::from(d));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".config"));
+    }
+    dirs
+}
+
+/// Какие инстансы есть на этой машине: `ai-dev-<имя>.env` в каталогах
+/// поиска. Нужно и `doctor`, и подсказке «укажите --instance».
+pub fn known_instances() -> Vec<(String, PathBuf)> {
+    known_instances_in(&instance_dirs())
+}
+
+pub fn known_instances_in(dirs: &[PathBuf]) -> Vec<(String, PathBuf)> {
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix("ai-dev-") else {
+                continue;
+            };
+            let Some(instance) = rest.strip_suffix(".env") else {
+                continue;
+            };
+            if instance.is_empty() || found.iter().any(|(i, _)| i == instance) {
+                continue;
+            }
+            found.push((instance.to_string(), entry.path()));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
 /// Разбор `KEY=value` в том объёме, в каком его понимает systemd
 /// `EnvironmentFile`: комментарии, пустые строки, необязательные кавычки.
 pub fn parse_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
@@ -527,6 +573,19 @@ mod tests {
         assert_eq!(vars["QUOTED"], "значение");
         // Закомментированная строка не должна побеждать настоящую.
         assert_eq!(vars["TELEGRAM_CHAT_ID"], "1");
+    }
+
+    #[test]
+    fn instances_are_found_by_config_name() {
+        let dir = std::env::temp_dir().join(format!("ai-dev-inst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["ai-dev-backend.env", "ai-dev-android.env", "прочее.env"] {
+            std::fs::write(dir.join(name), b"REPO_DIR=/tmp\n").unwrap();
+        }
+        let found = known_instances_in(std::slice::from_ref(&dir));
+        let names: Vec<&str> = found.iter().map(|(i, _)| i.as_str()).collect();
+        assert_eq!(names, vec!["android", "backend"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

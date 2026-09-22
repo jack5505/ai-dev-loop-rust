@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 
 use ai_dev::agent::{Agent, Claude, DryAgent};
 use ai_dev::clock::{Clock, SystemClock};
-use ai_dev::config::{AgentAuth, Config, Report};
+use ai_dev::config::{known_instances, AgentAuth, Config, Report};
 use ai_dev::exec::{systemctl, which, Cmd};
 use ai_dev::gh::cli::GhCli;
 use ai_dev::gh::dry::DryGitHub;
@@ -160,13 +160,56 @@ async fn run_command(cli: Cli) -> Result<i32> {
     }
 }
 
+/// Какой инстанс брать, если `--instance` не указан.
+///
+/// Под systemd переменные уже в окружении, и инстанс не нужен вовсе. В
+/// интерактивной сессии окружения нет, поэтому смотрим `AI_DEV_INSTANCE`, а
+/// если на машине настроен ровно один инстанс — берём его: набирать
+/// `--instance` каждый раз незачем.
+fn resolve_instance(explicit: Option<&str>) -> Option<String> {
+    if let Some(name) = explicit {
+        return Some(name.to_string());
+    }
+    if let Ok(name) = std::env::var("AI_DEV_INSTANCE") {
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    if std::env::var_os("REPO_DIR").is_some() {
+        return None;
+    }
+    let found = known_instances();
+    if found.len() == 1 {
+        let name = found[0].0.clone();
+        tracing::info!("Инстанс не указан — беру единственный настроенный: {name}");
+        return Some(name);
+    }
+    None
+}
+
 /// Загрузка конфигурации с правильным кодом возврата: ошибка конфигурации
 /// не должна выглядеть как падение оркестратора.
 fn load_config(instance: Option<&str>) -> Result<Config, i32> {
-    match Config::load(instance) {
+    let resolved = resolve_instance(instance);
+    match Config::load(resolved.as_deref()) {
         Ok(cfg) => Ok(cfg),
         Err(e) => {
             tracing::info!("⚙️ Ошибка конфигурации: {e:#}");
+            if resolved.is_none() {
+                let found = known_instances();
+                if found.is_empty() {
+                    tracing::info!(
+                        "Конфигов ai-dev-<инстанс>.env не найдено — смотри ai-dev doctor."
+                    );
+                } else {
+                    let names: Vec<&str> = found.iter().map(|(i, _)| i.as_str()).collect();
+                    tracing::info!(
+                        "На этой машине настроены инстансы: {}. Укажите --instance <имя> \
+                         или задайте AI_DEV_INSTANCE=<имя> в окружении.",
+                        names.join(", ")
+                    );
+                }
+            }
             Err(exit::CONFIG)
         }
     }
@@ -651,22 +694,7 @@ async fn cmd_doctor() -> Result<i32> {
     }
 
     println!("— Инстансы —");
-    let mut found = Vec::new();
-    for dir in instance_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if let Some(rest) = name.strip_prefix("ai-dev-") {
-                if let Some(inst) = rest.strip_suffix(".env") {
-                    if !found.iter().any(|(i, _): &(String, _)| i == inst) {
-                        found.push((inst.to_string(), e.path()));
-                    }
-                }
-            }
-        }
-    }
+    let found = known_instances();
     if found.is_empty() {
         println!("  ·  конфигов ai-dev-<инстанс>.env не найдено");
     }
@@ -741,17 +769,3 @@ async fn cmd_doctor() -> Result<i32> {
     }
 }
 
-fn instance_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(d) = std::env::var_os("AI_DEV_CONFIG_DIR") {
-        dirs.push(std::path::PathBuf::from(d));
-    }
-    dirs.push(std::path::PathBuf::from("/etc"));
-    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME") {
-        dirs.push(std::path::PathBuf::from(d));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(std::path::PathBuf::from(home).join(".config"));
-    }
-    dirs
-}
