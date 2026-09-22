@@ -278,11 +278,24 @@ async fn cmd_run(instance: Option<&str>, dry_run: bool, issue: Option<u64>) -> R
         tracing::info!("⚠️ {w}");
     }
 
-    let _guard = match lock::try_acquire(&ctx.cfg.lock_file)? {
-        Some(g) => g,
-        None => {
-            tracing::info!("Другой запуск ещё работает — выходим.");
-            return Ok(exit::OK);
+    // Замок держим только в боевом режиме. Неделя `--dry-run` по таймеру
+    // идёт рядом с боевым bash по тому же LOCK_FILE: если сухой прогон
+    // заберёт замок, боевая итерация пропустит свой круг. Читать состояние
+    // под работающей итерацией безопасно — изменяющих действий здесь нет.
+    let _guard = if dry_run {
+        if lock::is_busy(&ctx.cfg.lock_file).unwrap_or(false) {
+            tracing::info!(
+                "Замок занят (идёт итерация) — сухой прогон продолжаю только на чтение."
+            );
+        }
+        None
+    } else {
+        match lock::try_acquire(&ctx.cfg.lock_file)? {
+            Some(g) => Some(g),
+            None => {
+                tracing::info!("Другой запуск ещё работает — выходим.");
+                return Ok(exit::OK);
+            }
         }
     };
 

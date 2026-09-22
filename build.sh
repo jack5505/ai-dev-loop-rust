@@ -33,6 +33,16 @@ case "${1:-debug}" in
         cargo clippy --all-targets --target-dir target/clippy -- -D warnings; \
         rc=\$?; chown -R $(id -u):$(id -g) target 2>/dev/null || true; exit \$rc"
     ;;
-  fmt)     run cargo fmt --check ;;
+  fmt)
+    # rustfmt, как и clippy, в образе отсутствует — ставим внутрь контейнера.
+    mkdir -p "$ROOT/target/clippy-cargo"
+    docker run --rm \
+      -e CARGO_HOME=/work/target/clippy-cargo \
+      -v "$ROOT:/work" \
+      -w /work \
+      "$IMAGE" sh -c "rustup component add rustfmt >/dev/null 2>&1 || true; \
+        cargo fmt ${FMT_ARGS:---check}; \
+        rc=\$?; chown -R $(id -u):$(id -g) target src tests 2>/dev/null || true; exit \$rc"
+    ;;
   *)       run cargo build --target-dir target/musl ;;
 esac

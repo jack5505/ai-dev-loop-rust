@@ -42,6 +42,10 @@ pub struct Label {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Issue {
+    /// `gh issue view --json body,comments` не отдаёт номер вовсе, поэтому
+    /// поле обязано иметь значение по умолчанию: иначе разбор падает и
+    /// проход разблокировки (C6) молча не видит ни одной задачи.
+    #[serde(default)]
     pub number: u64,
     #[serde(default)]
     pub title: String,
@@ -142,5 +146,50 @@ impl Pr {
             Some(serde_json::Value::Null) => false,
             Some(_) => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Регрессия: `gh issue view N --json body,comments` не возвращает номер.
+    /// Пока поле было обязательным, разбор падал на каждой задаче, и проход
+    /// разблокировки (C6) не видел ни одной — ошибка нашлась сухим прогоном
+    /// на боевых данных.
+    #[test]
+    fn issue_view_without_number_parses() {
+        let raw = r#"{"body":"тело задачи","comments":[
+            {"author":{"login":"claude"},"body":"BLOCKED-BY: jack5505/mahalla#247",
+             "createdAt":"2026-09-19T10:00:00Z"}]}"#;
+        let issue: Issue = serde_json::from_str(raw).expect("разбор ответа gh");
+        assert_eq!(issue.number, 0);
+        assert_eq!(issue.body_str(), "тело задачи");
+        let comments = issue.comments.expect("комментарии");
+        assert_eq!(comments[0].author.login, "claude");
+        assert!(comments[0].created_at.is_some());
+    }
+
+    #[test]
+    fn pr_row_from_list_parses() {
+        let raw = r#"[{"number":327,"url":"https://github.com/a/b/pull/327",
+            "body":"AI-TASK: #300\nCloses #300","updatedAt":"2026-09-18T12:00:00Z",
+            "mergeable":"CONFLICTING","mergeStateStatus":"DIRTY",
+            "autoMergeRequest":null,"headRefName":"ai/issue-300"}]"#;
+        let prs: Vec<Pr> = serde_json::from_str(raw).expect("разбор списка PR");
+        let pr = &prs[0];
+        assert_eq!(pr.mergeable_state(), Mergeable::Conflicting);
+        assert!(!pr.auto_merge_queued());
+        assert!(merge_state_is_conflict(
+            pr.merge_state_status.as_deref().unwrap()
+        ));
+        assert_eq!(pr.head_ref_name.as_deref(), Some("ai/issue-300"));
+    }
+
+    #[test]
+    fn queued_auto_merge_is_detected() {
+        let raw = r#"{"autoMergeRequest":{"enabledAt":"2026-09-20T10:00:00Z"}}"#;
+        let pr: Pr = serde_json::from_str(raw).expect("разбор PR");
+        assert!(pr.auto_merge_queued());
     }
 }
