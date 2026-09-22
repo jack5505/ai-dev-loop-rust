@@ -768,4 +768,3 @@ async fn cmd_doctor() -> Result<i32> {
         Ok(exit::CONFIG)
     }
 }
-
