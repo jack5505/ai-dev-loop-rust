@@ -1,0 +1,12 @@
+[Unit]
+Description=AI dev loop (%i) — смотритель бэклога
+
+[Service]
+Type=oneshot
+User=aidev
+# Тот же env, что и у оркестратора: REPO_DIR, метки, Telegram, ключи.
+EnvironmentFile=/etc/ai-dev-%i.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/ai-dev/bin/ai-dev backlog --instance %i
+Nice=15
+TimeoutStartSec=2h

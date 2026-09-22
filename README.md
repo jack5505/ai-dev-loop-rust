@@ -1,0 +1,119 @@
+# ai-dev — оркестратор AI dev loop на Rust
+
+Один бинарник вместо двух bash-скриптов (`orchestrator-ci.sh`, 802 строки, и
+`backlog-keeper.sh`). Делает одну итерацию разработки: берёт задачу из очереди
+GitHub issues → получает реализацию от агента → открывает PR → ждёт CI →
+проводит авто-ревью → ставит на merge либо зовёт человека.
+
+Перенос выполнен по спецификации «AI dev loop → Rust» от 2026-09-22. Источник
+истины поведения — установленный на сервере `orchestrator-ci.sh`; все 11
+контрактов C1–C11 из спецификации сохранены, каждый оплачен инцидентом.
+Осознанные отличия от bash перечислены в [PORT-NOTES.md](PORT-NOTES.md).
+
+## Подкоманды
+
+| Команда | Что делает |
+| --- | --- |
+| `ai-dev run [--instance N] [--once] [--dry-run] [--issue N]` | одна итерация цикла |
+| `ai-dev backlog [--instance N] [--force] [--dry-run]` | смотритель бэклога (раз в неделю) |
+| `ai-dev queue [--instance N] [--json]` | очередь — тем же запросом, что итерация (C1) |
+| `ai-dev unblock [--instance N] [--dry-run]` | вернуть в очередь задачи с закрытым блокером |
+| `ai-dev watch-prs [--instance N] [--json]` | сводка по зависшим и конфликтующим AI-PR |
+| `ai-dev status [--instance N]` | замок, отметки, состояние итераций |
+| `ai-dev config check [--instance N]` | валидация конфига, включая контракт C9 |
+| `ai-dev doctor` | gh/git/claude, авторизация, инстансы, юниты |
+
+Коды возврата: `0` — штатное завершение (включая «очередь пуста», «замок занят»
+и «ушло человеку»), `1` — авария, `2` — ошибка конфигурации (не повод для
+алерта «оркестратор упал»).
+
+`--dry-run` печатает каждое изменяющее действие и не выполняет его; читающие
+запросы идут как обычно. Это основной инструмент сверки с bash-версией.
+
+## Конфигурация
+
+Формат тот же, что у bash: файл `KEY=value`, права 0600 — его читают и systemd
+(`EnvironmentFile=`), и `ai-dev`. Переменная окружения важнее файла: под systemd
+они уже заданы, а `--instance` нужен для ручного запуска.
+
+Файл ищется в первом подходящем месте:
+
+1. `$AI_DEV_CONFIG_DIR/ai-dev-<инстанс>.env`
+2. `/etc/ai-dev-<инстанс>.env` — раскладка DEPLOY.md
+3. `$XDG_CONFIG_HOME/ai-dev-<инстанс>.env`
+4. `~/.config/ai-dev-<инстанс>.env` — rootless-раскладка (у пользователя нет sudo)
+
+Переменные и значения по умолчанию — приложение А спецификации; полный список
+печатает `ai-dev config check`. Обязательна только `REPO_DIR`. Ровно одна из
+`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` должна быть непустой;
+`--max-budget-usd` добавляется агенту только с API-ключом.
+
+## Сборка
+
+На сервере с оркестратором может не быть ни линковщика, ни прав на `apt`,
+поэтому сборка идёт в контейнере, а на сервер приезжает готовый статический
+бинарник:
+
+```sh
+./build.sh release   # target/musl/release/ai-dev, static-pie, без зависимостей
+./build.sh test      # юнит- и сценарные тесты
+./build.sh clippy    # clippy -D warnings
+```
+
+Обычный `cargo build` тоже работает, если в системе есть `cc`.
+
+## Установка
+
+```sh
+# системная раскладка
+sudo install -m 0755 ai-dev /opt/ai-dev/bin/ai-dev
+sudo cp systemd/system/*.service systemd/system/*.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now ai-dev@backend.timer
+
+# rootless (нет пароля sudo)
+install -m 0755 ai-dev ~/.local/bin/ai-dev
+cp systemd/user/*.service systemd/user/*.timer ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now ai-dev@backend.timer
+```
+
+Перед включением таймера: `ai-dev doctor` и `ai-dev config check --instance <N>`.
+**C9**: `TimeoutStartSec` юнита обязан быть заметно больше `APP_WAIT_MIN` —
+`config check` это проверяет и не даёт запустить итерацию с плохим запасом.
+
+Диагностика журнала (юниты шаблонные, `ai-dev.service` не существует):
+
+```sh
+journalctl -u 'ai-dev@*' -n 200 --no-pager -q          # системные юниты
+journalctl --user -u 'ai-dev@*' -n 200 --no-pager -q   # rootless
+```
+
+## Откат
+
+Состояние цикла целиком живёт в GitHub — метки, комментарии, маркеры
+`BLOCKED-BY`/`ORIGIN`/`AI-TASK` — плюс каталог `.ai-logs` в клоне. Поэтому
+переключение между bash и Rust безопасно в любой момент между итерациями:
+верните `ExecStart` на `orchestrator-ci.sh`, `daemon-reload`, и цикл продолжит
+с того же места. Замок (`flock` на `LOCK_FILE`) у обеих реализаций общий, так
+что одновременный запуск исключён даже во время переключения.
+
+## Порядок ввода в строй
+
+Спецификация разводит этапы намеренно: сначала читающие команды, потом
+`github-app` (агент работает на раннерах, цена ошибки ниже), потом `local`.
+
+1. `ai-dev queue` даёт то же число, что bash, на обоих инстансах.
+2. `ai-dev unblock --dry-run`, `watch-prs`, `status` совпадают с поведением bash.
+3. Неделя `run --dry-run` по таймеру рядом с боевым bash — решения в логах
+   должны совпадать.
+4. Переключение `github-app`-инстанса, затем `local`.
+5. `backlog`, затем отмена по SIGTERM и `state-<issue>.json`.
+
+## Тесты
+
+* `markers.rs` — фикстуры реальных инцидентов: маркер в середине строки не
+  ловится, маркер старше момента поручения не ловится, `Claude finished` от
+  автора `claude` ловится.
+* `tests/scenarios.rs` — итерация целиком на фейковых `GitHub`/`Agent`/`Clock`/
+  `Vcs`: очередь пуста; агент без коммитов; ответ за 36 секунд без PR; PR найден
+  до обращения к `@claude`; `CONFLICTING` → rework → merge; два круга
+  `REQUEST_CHANGES` → человек; SIGTERM посреди ожидания → метка проставлена.

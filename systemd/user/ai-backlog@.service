@@ -1,0 +1,12 @@
+[Unit]
+Description=AI dev loop (%i) — смотритель бэклога
+
+[Service]
+Type=oneshot
+# Тот же env (~/.config/ai-dev-%i.env), что и у оркестратора: REPO_DIR, метки, Telegram, ключи.
+EnvironmentFile=%h/.config/ai-dev-%i.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=%h
+ExecStart=%h/.local/bin/ai-dev backlog --instance %i
+Nice=15
+TimeoutStartSec=2h

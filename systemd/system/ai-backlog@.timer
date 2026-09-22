@@ -1,0 +1,15 @@
+[Unit]
+Description=Тик смотрителя бэклога (%i) — работает раз в неделю
+
+[Timer]
+# Тикаем ежечасно, а работаем раз в KEEPER_INTERVAL_DAYS (по умолчанию 7):
+# частоту держит сам бинарник по отметке .ai-logs/.backlog-keeper-last.
+# Недельный таймер здесь не годится — замок общий с оркестратором (C10), и
+# тик, попавший на многочасовую итерацию, стоил бы целой недели.
+OnBootSec=10min
+OnUnitInactiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

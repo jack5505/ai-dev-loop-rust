@@ -1,0 +1,14 @@
+[Unit]
+Description=AI dev loop (%i) — одна итерация разработки
+
+[Service]
+Type=oneshot
+User=aidev
+# %i = имя инстанса: ai-dev@backend → /etc/ai-dev-backend.env
+EnvironmentFile=/etc/ai-dev-%i.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/ai-dev/bin/ai-dev run --instance %i
+Nice=10
+# C9: потолок обязан быть заметно больше APP_WAIT_MIN (по умолчанию 180 мин).
+# Проверяется командой `ai-dev config check --instance %i`.
+TimeoutStartSec=4h
