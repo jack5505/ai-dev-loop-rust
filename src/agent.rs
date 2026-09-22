@@ -37,11 +37,24 @@ pub trait Agent: Send + Sync {
 }
 
 pub struct Claude {
+    program: String,
     args: Vec<String>,
     repo_dir: PathBuf,
 }
 
 impl Claude {
+    pub fn new(
+        program: impl Into<String>,
+        args: Vec<String>,
+        repo_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            repo_dir: repo_dir.into(),
+        }
+    }
+
     pub fn from_config(cfg: &Config) -> Self {
         // Бюджетный лимит имеет смысл только с API-ключом.
         let mut args = vec![
@@ -54,14 +67,11 @@ impl Claude {
             args.push("--max-budget-usd".to_string());
             args.push(cfg.max_budget_usd.clone());
         }
-        Self {
-            args,
-            repo_dir: cfg.repo_dir.clone(),
-        }
+        Self::new("claude", args, cfg.repo_dir.clone())
     }
 
     pub fn command_preview(&self) -> String {
-        let mut parts = vec!["claude".to_string()];
+        let mut parts = vec![self.program.clone()];
         parts.extend(self.args.clone());
         shell_words::join(parts)
     }
@@ -70,7 +80,7 @@ impl Claude {
 #[async_trait]
 impl Agent for Claude {
     async fn run(&self, req: AgentRequest) -> Result<AgentRun> {
-        let mut cmd = tokio::process::Command::new("claude");
+        let mut cmd = tokio::process::Command::new(&self.program);
         cmd.args(&self.args)
             .arg(&req.prompt)
             .current_dir(&self.repo_dir)
@@ -86,7 +96,9 @@ impl Agent for Claude {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn().context("не удалось запустить claude")?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("не удалось запустить {}", self.program))?;
 
         if let Some(data) = req.stdin.as_ref() {
             let mut sink = child.stdin.take().expect("stdin как piped");
@@ -97,8 +109,11 @@ impl Agent for Claude {
             drop(sink);
         }
 
-        // `2>&1 | tee лог`: вывод идёт и в журнал юнита, и в файл, и в
-        // буфер (ревью читает вердикт из него).
+        // `2>&1 | tee лог`: оба потока идут в журнал юнита и в файл, но в
+        // `output` попадает ТОЛЬКО stdout. Ревью читает вердикт из него, а
+        // предупреждения CLI на stderr не должны уезжать комментарием в PR:
+        // в bash ревью снималось как `$(claude …)` без `2>&1`, и stderr туда
+        // не попадал.
         let mut out_lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
         let mut err_lines = BufReader::new(child.stderr.take().expect("stderr")).lines();
         let mut buf = String::new();
@@ -106,42 +121,32 @@ impl Agent for Claude {
             Some(path) => Some(open_log(path).await?),
             None => None,
         };
+        let mut out_open = true;
+        let mut err_open = true;
 
-        loop {
-            let line = tokio::select! {
-                l = out_lines.next_line() => l.context("чтение stdout агента")?,
-                l = err_lines.next_line() => l.context("чтение stderr агента")?,
-            };
-            match line {
-                Some(line) => {
-                    println!("{line}");
-                    buf.push_str(&line);
-                    buf.push('\n');
-                    if let Some(f) = file.as_mut() {
-                        let _ = f.write_all(line.as_bytes()).await;
-                        let _ = f.write_all(b"\n").await;
+        while out_open || err_open {
+            let (line, is_stdout) = tokio::select! {
+                l = out_lines.next_line(), if out_open => {
+                    match l.context("чтение stdout агента")? {
+                        Some(line) => (line, true),
+                        None => { out_open = false; continue; }
                     }
                 }
-                None => break,
-            }
-        }
-        // Второй поток мог не закрыться одновременно с первым.
-        while let Ok(Some(line)) = out_lines.next_line().await {
+                l = err_lines.next_line(), if err_open => {
+                    match l.context("чтение stderr агента")? {
+                        Some(line) => (line, false),
+                        None => { err_open = false; continue; }
+                    }
+                }
+            };
             println!("{line}");
-            buf.push_str(&line);
-            buf.push('\n');
             if let Some(f) = file.as_mut() {
                 let _ = f.write_all(line.as_bytes()).await;
                 let _ = f.write_all(b"\n").await;
             }
-        }
-        while let Ok(Some(line)) = err_lines.next_line().await {
-            println!("{line}");
-            buf.push_str(&line);
-            buf.push('\n');
-            if let Some(f) = file.as_mut() {
-                let _ = f.write_all(line.as_bytes()).await;
-                let _ = f.write_all(b"\n").await;
+            if is_stdout {
+                buf.push_str(&line);
+                buf.push('\n');
             }
         }
         if let Some(f) = file.as_mut() {
@@ -192,5 +197,50 @@ impl Agent for DryAgent {
             success: true,
             output: "(dry-run: агент не запускался)\nVERDICT: APPROVE".to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Регрессия, найденная первой боевой итерацией: предупреждение CLI
+    /// со stderr уехало в комментарий с авто-ревью прямо в PR. В `output`
+    /// должен попадать только stdout, а в лог — оба потока.
+    #[tokio::test]
+    async fn stderr_reaches_the_log_but_not_the_output() {
+        let dir = std::env::temp_dir().join(format!("ai-dev-agent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("каталог теста");
+        let log = dir.join("agent.log");
+
+        let agent = Claude::new(
+            "sh",
+            vec![
+                "-c".to_string(),
+                "printf 'замечаний нет\nVERDICT: APPROVE\n';                  printf 'Ignoring 4 permissions.allow entries\n' >&2"
+                    .to_string(),
+            ],
+            &dir,
+        );
+        let run = agent
+            .run(AgentRequest {
+                prompt: String::new(),
+                stdin: None,
+                log_file: Some(log.clone()),
+            })
+            .await
+            .expect("запуск агента");
+
+        assert!(run.success);
+        assert!(run.output.contains("VERDICT: APPROVE"));
+        assert!(
+            !run.output.contains("Ignoring"),
+            "stderr не должен попадать в вывод: {:?}",
+            run.output
+        );
+        let logged = std::fs::read_to_string(&log).expect("лог агента");
+        assert!(logged.contains("Ignoring"), "stderr обязан быть в логе");
+        assert!(logged.contains("VERDICT: APPROVE"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
