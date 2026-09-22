@@ -36,8 +36,8 @@ GitHub issues → получает реализацию от агента → о
 ## Конфигурация
 
 Формат тот же, что у bash: файл `KEY=value`, права 0600 — его читают и systemd
-(`EnvironmentFile=`), и `ai-dev`. Переменная окружения важнее файла: под systemd
-они уже заданы, а `--instance` нужен для ручного запуска.
+(`EnvironmentFile=`), и `ai-dev`. Комментарии `#` и префикс `export`
+понимаются, неизвестные ключи игнорируются.
 
 Файл ищется в первом подходящем месте:
 
@@ -46,17 +46,112 @@ GitHub issues → получает реализацию от агента → о
 3. `$XDG_CONFIG_HOME/ai-dev-<инстанс>.env`
 4. `~/.config/ai-dev-<инстанс>.env` — rootless-раскладка (у пользователя нет sudo)
 
-Если `--instance` не указан, инстанс берётся из `AI_DEV_INSTANCE`, а когда на
-машине настроен ровно один конфиг — из него. Под systemd не нужно ни то, ни
-другое: переменные уже в окружении. Когда инстансов несколько и ни один не
-назван, `ai-dev` печатает их список вместо невнятной ошибки.
+Какой инстанс берётся, если `--instance` не указан: из `AI_DEV_INSTANCE`, а
+когда на машине настроен ровно один конфиг — из него. Под systemd не нужно ни
+то, ни другое: переменные уже в окружении. Когда инстансов несколько и ни один
+не назван, `ai-dev` печатает их список вместо невнятной ошибки.
 
-`ai-dev config check` печатает все действующие значения — с пометкой
-«← из окружения» там, где переменная окружения перебила файл (первая причина
-«правлю файл, ничего не меняется»), и без секретов: про токены сообщается
-только, какой из них задан. `--json` даёт то же машинно-читаемо. Обязательна только `REPO_DIR`. Ровно одна из
-`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` должна быть непустой;
-`--max-budget-usd` добавляется агенту только с API-ключом.
+**Переменная окружения важнее файла.** Под systemd так и работает, а при ручном
+запуске это первая причина «правлю файл, ничего не меняется» — `config check`
+помечает такие значения словами «← из окружения».
+
+### Значения
+
+Обязательна только `REPO_DIR`. Ровно одна из `CLAUDE_CODE_OAUTH_TOKEN` /
+`ANTHROPIC_API_KEY` должна быть непустой; `--max-budget-usd` добавляется агенту
+только с API-ключом.
+
+| Ключ | По умолчанию | Смысл |
+| --- | --- | --- |
+| `REPO_DIR` | — | клон репозитория, единственный обязательный |
+| `BASE_BRANCH` | `main` | база для PR |
+| `DEV_MODE` | `local` | `local` — агент работает на сервере; `github-app` — `@claude` на раннерах Actions |
+| `AUTO_MERGE` | `false` | `true` → одобренный ревью PR уходит в squash-авто-merge |
+| `CLAUDE_MODEL` | `sonnet` | модель агента |
+| `MAX_ITERATIONS` | `3` | попыток починить красный CI |
+| `MAX_REVIEW_ROUNDS` | `2` | кругов авто-ревью до вызова человека |
+| `APP_WAIT_MIN` | `180` | минут ждать PR или фикс от `@claude` (см. C9) |
+| `CI_START_WAIT` | `30` | секунд на старт Actions перед опросом чеков |
+| `PR_STALE_DAYS` | `3` | порог «PR завис» для сторожа открытых PR |
+| `TASK_LABEL` | `ai-task` | метка очереди |
+| `HUMAN_LABEL` | `needs-human` | метка «нужен человек» |
+| `BLOCKED_LABEL` | `blocked` | метка межрепозиторной блокировки |
+| `ALLOWED_AUTHORS` | владелец gh-токена | доверенные авторы issue через пробел (защита от prompt injection) |
+| `PARTNER_REPO` | пусто | второй репозиторий проекта, `owner/name` |
+| `MAX_NEW_TASKS` | `5` | потолок новых задач смотрителя за один проход |
+| `KEEPER_INTERVAL_DAYS` | `7` | как часто смотритель реально работает |
+| `MAX_BUDGET_USD` | `5` | лимит на вызов, действует только с `ANTHROPIC_API_KEY` |
+| `LOCK_FILE` | `/tmp/ai-dev-<repo>.lock` | замок, общий у оркестратора и смотрителя (C10) |
+| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | пусто | задаются вместе либо оба пустые |
+| `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` | — | аутентификация агента, ровно одно из двух |
+
+### Поменять значение
+
+```sh
+$EDITOR ~/.config/ai-dev-backend.env       # правим строку, например AUTO_MERGE=true
+ai-dev config check --instance backend     # проверяем, что получилось
+```
+
+`daemon-reload` не нужен: systemd читает `EnvironmentFile` при каждом старте
+службы, поэтому новое значение подхватится со следующего тика таймера.
+Перезагрузка юнитов нужна только при правке самого `.service` — например
+`TimeoutStartSec`.
+
+Разовый запуск с другим значением, не трогая файл:
+
+```sh
+CLAUDE_MODEL=sonnet MAX_ITERATIONS=1 ai-dev run --instance backend
+```
+
+### Посмотреть
+
+```sh
+ai-dev config check --instance backend          # все действующие значения + валидация
+ai-dev config check --instance backend --json   # то же машинно-читаемо
+ai-dev status --instance backend                # замок, отметки, состояние итераций
+ai-dev queue --instance backend                 # что сейчас в очереди (C1)
+ai-dev watch-prs --instance backend --json      # открытые AI-PR: конфликты и зависшие
+ai-dev doctor                                   # оба инстанса разом, gh/git/claude, юниты
+```
+
+`config check` показывает и незаданные ключи — со значением по умолчанию,
+чего не даёт `cat` конфига, — и не печатает секреты: про токены сообщается
+только, какой из двух задан. Код возврата 2 означает, что итерацию с такой
+конфигурацией запускать нельзя.
+
+Если нужно загрузить весь конфиг в текущую оболочку (осторожно: в окружение
+попадут и токены):
+
+```sh
+set -a; . ~/.config/ai-dev-backend.env; set +a
+```
+
+## Эксплуатация
+
+```sh
+systemctl --user list-timers --all                   # когда следующий запуск
+journalctl --user -u 'ai-dev@*' -n 200 --no-pager -q # лог итераций (rootless)
+journalctl -u 'ai-dev@*' -n 200 --no-pager -q        # он же для системных юнитов
+systemctl --user start ai-dev@backend.service        # прогнать итерацию сейчас
+```
+
+Юниты шаблонные: `ai-dev.service` без `@<инстанс>` не существует, и рецепт
+`journalctl -u ai-dev.service` каждый раз заводит диагностику в ложный тупик.
+
+Смотритель бэклога тикает ежечасно, а работает раз в `KEEPER_INTERVAL_DAYS`
+по отметке `.ai-logs/.backlog-keeper-last`. Включение и выключение:
+
+```sh
+systemctl --user enable --now ai-backlog@backend.timer
+systemctl --user disable --now ai-backlog@backend.timer
+ai-dev backlog --instance backend --force --dry-run   # посмотреть, что он сделает
+```
+
+Первый запуск после включения происходит сразу: отметки нет, значит проход
+«не наш круг» не срабатывает. Если очередь при этом пуста, смотритель дойдёт
+до второго поручения и заведёт до `MAX_NEW_TASKS` задач. Чтобы отложить первый
+проход на неделю, достаточно создать отметку заранее:
+`touch $REPO_DIR/.ai-logs/.backlog-keeper-last`.
 
 ## Сборка
 
@@ -89,13 +184,7 @@ systemctl --user daemon-reload && systemctl --user enable --now ai-dev@backend.t
 Перед включением таймера: `ai-dev doctor` и `ai-dev config check --instance <N>`.
 **C9**: `TimeoutStartSec` юнита обязан быть заметно больше `APP_WAIT_MIN` —
 `config check` это проверяет и не даёт запустить итерацию с плохим запасом.
-
-Диагностика журнала (юниты шаблонные, `ai-dev.service` не существует):
-
-```sh
-journalctl -u 'ai-dev@*' -n 200 --no-pager -q          # системные юниты
-journalctl --user -u 'ai-dev@*' -n 200 --no-pager -q   # rootless
-```
+Команды наблюдения за работающим циклом — в разделе «Эксплуатация» выше.
 
 ## Откат
 
